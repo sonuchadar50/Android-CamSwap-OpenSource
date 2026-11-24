@@ -41,10 +41,6 @@ import io.github.zensu357.camswap.utils.VideoManager;
 
 import io.github.zensu357.camswap.api101.Api101Runtime;
 
-/**
-- Handles Camera2 session interception: replaces real camera surfaces with
-- a virtual surface, then starts video playback via {@link MediaPlayerManager}.
- */
 public final class Camera2SessionHook {
     private static final int WHATSAPP_YUV_BRIDGE_MAX_IMAGES = 8;
 
@@ -59,13 +55,11 @@ public final class Camera2SessionHook {
     private volatile String currentActivityClassName;
     private volatile CameraCaptureSession activeCaptureSession;
 
-    // Camera2 surfaces
     Surface previewSurface;
     Surface previewSurface1;
     Surface readerSurface;
     Surface readerSurface1;
 
-    // Tracker for Photo Fake
     public final Set<Surface> trackedReaderSurfaces = Collections
             .newSetFromMap(new ConcurrentHashMap<Surface, Boolean>());
     public final Set<Long> trackedReaderNativeHandles = Collections
@@ -258,7 +252,6 @@ public final class Camera2SessionHook {
             return;
         }
 
-        // onOpened
         try {
             Method m = resolveMethodOnClass(hookedClass, "onOpened", CameraDevice.class);
             Api101Runtime.requireModule().hook(m).intercept(chain -> {
@@ -304,7 +297,6 @@ public final class Camera2SessionHook {
             LogUtil.log("【CS】Hook onOpened 失败: " + t);
         }
 
-        // onClosed
         try {
             Method m = resolveMethodOnClass(hookedClass, "onClosed", CameraDevice.class);
             Api101Runtime.requireModule().hook(m).intercept(chain -> {
@@ -326,7 +318,6 @@ public final class Camera2SessionHook {
             LogUtil.log("【CS】Hook onClosed 失败: " + t);
         }
 
-        // onError
         try {
             Method m = resolveMethodOnClass(hookedClass, "onError", CameraDevice.class, int.class);
             Api101Runtime.requireModule().hook(m).intercept(chain -> {
@@ -342,7 +333,6 @@ public final class Camera2SessionHook {
             LogUtil.log("【CS】Hook onError 失败: " + t);
         }
 
-        // onDisconnected
         try {
             Method m = resolveMethodOnClass(hookedClass, "onDisconnected", CameraDevice.class);
             Api101Runtime.requireModule().hook(m).intercept(chain -> {
@@ -377,3 +367,572 @@ public final class Camera2SessionHook {
         if (readerSurface == lastInitReader && readerSurface1 == lastInitReader1
                 && previewSurface == lastInitPreview && previewSurface1 == lastInitPreview1) {
             LogUtil.log("【CS】【SessionHook】跳过重复 startPlayback：所有 Surface 均未发生改变");
+            pendingPlayback = false;
+            return;
+        }
+
+        LogUtil.log("【CS】【SessionHook】[触发播放] Camera2 播放器装载 ->"
+                + " preview: " + previewSurface + " (isValid=" + (previewSurface != null && previewSurface.isValid()) + ")"
+                + ", preview1: " + previewSurface1 + " (isValid=" + (previewSurface1 != null && previewSurface1.isValid()) + ")"
+                + ", reader: " + readerSurface + " (isValid=" + (readerSurface != null && readerSurface.isValid()) + ")"
+                + ", reader1: " + readerSurface1 + " (isValid=" + (readerSurface1 != null && readerSurface1.isValid()) + ")");
+
+        lastInitReader = readerSurface;
+        lastInitReader1 = readerSurface1;
+        lastInitPreview = previewSurface;
+        lastInitPreview1 = previewSurface1;
+        pendingPlayback = false;
+        playerManager.initCamera2Players(readerSurface, readerSurface1,
+                previewSurface, previewSurface1);
+        markYuvBridgeSessionReadyIfPossible();
+        startContinuousYuvPumper();
+
+        int userRotation = VideoManager.getConfig().getInt(ConfigManager.KEY_VIDEO_ROTATION_OFFSET, 0);
+        MediaPlayerManager pm = HookMain.playerManager;
+        if (pm.c2_renderer != null) pm.c2_renderer.setRotation(userRotation);
+        if (pm.c2_renderer_1 != null) pm.c2_renderer_1.setRotation(userRotation);
+        LogUtil.log("【CS】【SessionHook】渲染器旋转角度已应用: " + userRotation + "°");
+    }
+
+    public static long getSurfaceNativeHandle(Surface surface) {
+        if (surface == null) return 0L;
+        try {
+            java.lang.reflect.Field field = Surface.class.getDeclaredField("mNativeObject");
+            field.setAccessible(true);
+            return field.getLong(surface);
+        } catch (Throwable t) {
+            try {
+                String str = surface.toString();
+                int idx = str.indexOf("mNativeObject=");
+                if (idx != -1) {
+                    int end = str.indexOf(")", idx);
+                    if (end != -1) {
+                        return Long.parseLong(str.substring(idx + 14, end).trim());
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        return 0L;
+    }
+
+    public void registerImageReaderSurface(Surface surface, int format, int width, int height) {
+        if (surface == null) {
+            return;
+        }
+        trackedReaderSurfaces.add(surface);
+        surfaceFormatMap.put(surface, format);
+        surfaceSizeMap.put(surface, new int[] { width, height });
+
+        long handle = getSurfaceNativeHandle(surface);
+        if (handle != 0L) {
+            trackedReaderNativeHandles.add(handle);
+            surfaceNativeFormatMap.put(handle, format);
+            surfaceNativeSizeMap.put(handle, new int[] { width, height });
+        }
+    }
+
+    public boolean isTrackedReaderSurface(Surface surface) {
+        if (surface == null) return false;
+        if (trackedReaderSurfaces.contains(surface)) return true;
+        long handle = getSurfaceNativeHandle(surface);
+        return handle != 0L && trackedReaderNativeHandles.contains(handle);
+    }
+
+    public boolean isJpegReaderSurface(Surface surface) {
+        if (surface == null) return false;
+        Integer format = surfaceFormatMap.get(surface);
+        if (format == null) {
+            long handle = getSurfaceNativeHandle(surface);
+            if (handle != 0L) format = surfaceNativeFormatMap.get(handle);
+        }
+        return format != null && format == ImageFormat.JPEG;
+    }
+
+    public boolean isYuvReaderSurface(Surface surface) {
+        if (surface == null) return false;
+        Integer format = surfaceFormatMap.get(surface);
+        if (format == null) {
+            long handle = getSurfaceNativeHandle(surface);
+            if (handle != 0L) format = surfaceNativeFormatMap.get(handle);
+        }
+        return format != null && format == ImageFormat.YUV_420_888;
+    }
+
+    public boolean shouldKeepRealReaderSurface(Surface surface) {
+        return isJpegReaderSurface(surface);
+    }
+
+    public boolean shouldKeepRealReaderSurfaceForPackage(Surface surface, String packageName) {
+        if (!isTrackedReaderSurface(surface)) {
+            return false;
+        }
+        return isJpegReaderSurface(surface);
+    }
+
+    public boolean shouldKeepRealReaderSurfaceForCurrentPackage(Surface surface) {
+        return shouldKeepRealReaderSurfaceForPackage(surface, getCurrentPackageName());
+    }
+
+    private boolean shouldKeepYuvReaderSurfaceForPackage(Surface surface, String packageName) {
+        if (!shouldUseFakeYuvBridgeForPackage(packageName)) {
+            return false;
+        }
+        return isYuvReaderSurface(surface)
+                && !isInternalFakeYuvReaderSurface(surface);
+    }
+
+    private boolean isCurrentSessionYuvReaderSurface(Surface surface) {
+        if (surface == null) {
+            return false;
+        }
+        return surface.equals(readerSurface) || surface.equals(readerSurface1)
+                || sessionKeptYuvSurfaces.contains(surface);
+    }
+
+    private boolean shouldDriveYuvBridgeNow() {
+        return !isReleasing && yuvBridgeSessionReady;
+    }
+
+    public boolean shouldKeepYuvReaderSurfaceForCurrentPackage(Surface surface) {
+        boolean keep = shouldKeepYuvReaderSurfaceForPackage(surface, getCurrentPackageName());
+        if (surface != null && isYuvReaderSurface(surface)) {
+            maybeLogYuvKeepDecision(surface, keep);
+        }
+        return keep;
+    }
+
+    private void maybeLogYuvKeepDecision(Surface surface, boolean keep) {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastYuvKeepLogMs < 5000L) {
+            return;
+        }
+        lastYuvKeepLogMs = now;
+        LogUtil.log("【CS】YUV keep: " + keep + " surface=" + surface);
+    }
+
+    public boolean shouldSkipImageReaderTracking() {
+        return internalBridgeCreationDepth.get() > 0;
+    }
+
+    public boolean shouldBypassYuvAcquireHook(Surface surface) {
+        return fakeYuvAcquireDepth.get() > 0 || isInternalFakeYuvReaderSurface(surface);
+    }
+
+    public boolean isInternalFakeYuvReaderSurface(Surface surface) {
+        return surface != null && internalFakeYuvReaderSurfaces.contains(surface);
+    }
+
+    private void enterInternalBridgeCreation() {
+        internalBridgeCreationDepth.set(internalBridgeCreationDepth.get() + 1);
+    }
+
+    private void exitInternalBridgeCreation() {
+        int depth = internalBridgeCreationDepth.get();
+        if (depth <= 1) {
+            internalBridgeCreationDepth.remove();
+        } else {
+            internalBridgeCreationDepth.set(depth - 1);
+        }
+    }
+
+    private void enterFakeYuvAcquire() {
+        fakeYuvAcquireDepth.set(fakeYuvAcquireDepth.get() + 1);
+    }
+
+    private void exitFakeYuvAcquire() {
+        int depth = fakeYuvAcquireDepth.get();
+        if (depth <= 1) {
+            fakeYuvAcquireDepth.remove();
+        } else {
+            fakeYuvAcquireDepth.set(depth - 1);
+        }
+    }
+
+    public boolean shouldUseReaderPlaybackSurfaceForPackage(String packageName) {
+        return !shouldUseFakeYuvBridgeForPackage(packageName);
+    }
+
+    private Surface getOutputSurface(Object output) {
+        if (output instanceof Surface) {
+            return (Surface) output;
+        }
+        if (output instanceof OutputConfiguration) {
+            return ((OutputConfiguration) output).getSurface();
+        }
+        return null;
+    }
+
+    private boolean shouldBypassWhatsAppYuvSession(List<?> outputs, String packageName) {
+        return false;
+    }
+
+    private void enableSessionBypass(String reason) {
+        if (!bypassCurrentSession) {
+            LogUtil.log("【CS】启用 YUV 会话旁路: " + reason);
+        }
+        setBypassCurrentSession(true);
+        pendingPlayback = false;
+        previewSurface = null;
+        previewSurface1 = null;
+        readerSurface = null;
+        readerSurface1 = null;
+        sessionKeptYuvSurfaces.clear();
+        playerManager.releaseCamera2Resources();
+    }
+
+    private void disableSessionBypass() {
+        setBypassCurrentSession(false);
+    }
+
+    public void rememberPreviewSurface(Surface surface) {
+        if (surface == null || isTrackedReaderSurface(surface)) {
+            return;
+        }
+        boolean isNew = false;
+        if (previewSurface == null) {
+            previewSurface = surface;
+            isNew = true;
+        } else if (!previewSurface.equals(surface) && previewSurface1 == null) {
+            previewSurface1 = surface;
+            isNew = true;
+        }
+        if (isNew || pendingPlayback) {
+            LogUtil.log("【CS】addTarget 触发播放 (preview: " + surface + ")");
+            startPlayback();
+        }
+    }
+
+    public void rememberReaderPlaybackSurface(Surface surface) {
+        if (!shouldUseReaderPlaybackSurfaceForPackage(getCurrentPackageName())) {
+            return;
+        }
+        if (surface == null || shouldKeepRealReaderSurface(surface)) {
+            return;
+        }
+        if (isYuvReaderSurface(surface) && !shouldUseFakeYuvBridgeForPackage(getCurrentPackageName())) {
+            LogUtil.log("【CS】跳过 YUV reader surface 作为播放目标 (无 YUV 兼容): " + surface);
+            return;
+        }
+        boolean isNew = false;
+        if (readerSurface == null) {
+            readerSurface = surface;
+            isNew = true;
+        } else if (!readerSurface.equals(surface) && readerSurface1 == null) {
+            readerSurface1 = surface;
+            isNew = true;
+        }
+        if (isNew || pendingPlayback) {
+            LogUtil.log("【CS】addTarget 触发播放 (reader: " + surface + ")");
+            startPlayback();
+        }
+    }
+
+    public void onTargetRemoved(Surface surface) {
+        if (surface == null) {
+            return;
+        }
+        pendingJpegSurfaces.remove(surface);
+        if (surface.equals(previewSurface)) {
+            previewSurface = null;
+        }
+        if (surface.equals(previewSurface1)) {
+            previewSurface1 = null;
+        }
+        if (surface.equals(readerSurface)) {
+            readerSurface = null;
+        }
+        if (surface.equals(readerSurface1)) {
+            readerSurface1 = null;
+        }
+    }
+
+    public void markPendingJpegCapture(Surface surface) {
+        if (shouldKeepRealReaderSurface(surface)) {
+            pendingJpegSurfaces.add(surface);
+            pendingPhotoSurface = surface;
+        }
+    }
+
+    private synchronized void ensureVirtualDrainThread() {
+        if (virtualSurfaceDrainThread == null || !virtualSurfaceDrainThread.isAlive()) {
+            virtualSurfaceDrainThread = new HandlerThread("CS-VirtualDrain");
+            virtualSurfaceDrainThread.start();
+            virtualSurfaceDrainHandler = new Handler(virtualSurfaceDrainThread.getLooper());
+        }
+    }
+
+    private synchronized void releaseVirtualSurfaces() {
+        for (Surface vs : virtualSurfaces) {
+            if (vs != null) {
+                try {
+                    vs.release();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        virtualSurfaces.clear();
+        for (SurfaceTexture vt : virtualTextures) {
+            if (vt != null) {
+                try {
+                    vt.release();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        virtualTextures.clear();
+        originalToVirtualMap.clear();
+        originalNativeToVirtualMap.clear();
+    }
+
+    private synchronized Surface createVirtualSurface(int index) {
+        if (needRecreate) {
+            releaseVirtualSurfaces();
+            needRecreate = false;
+        }
+        ensureVirtualDrainThread();
+        while (virtualSurfaces.size() <= index) {
+            int texIndex = 15 + virtualSurfaces.size();
+            SurfaceTexture vt = new SurfaceTexture(texIndex);
+            vt.setDefaultBufferSize(1920, 1080);
+            vt.setOnFrameAvailableListener(st -> {
+                try {
+                    st.updateTexImage();
+                } catch (Exception ignored) {
+                }
+            }, virtualSurfaceDrainHandler);
+            Surface vs = new Surface(vt);
+            virtualTextures.add(vt);
+            virtualSurfaces.add(vs);
+            LogUtil.log("【CS】创建虚拟Surface[" + (virtualSurfaces.size() - 1) + "]: " + vs);
+        }
+        return virtualSurfaces.get(index);
+    }
+
+    private Surface createVirtualSurface() {
+        return createVirtualSurface(0);
+    }
+
+    private List<Surface> rewriteSessionSurfaces(List<?> outputs) {
+        return rewriteSessionSurfaces(outputs, getCurrentPackageName());
+    }
+
+    private List<Surface> rewriteSessionSurfaces(List<?> outputs, String packageName) {
+        LinkedHashSet<Surface> rewritten = new LinkedHashSet<>();
+        sessionKeptYuvSurfaces.clear();
+        int virtualIndex = 0;
+        if (outputs != null) {
+            for (Object output : outputs) {
+                if (output instanceof Surface) {
+                    Surface surface = (Surface) output;
+                    boolean isJpeg = isJpegReaderSurface(surface);
+                    boolean isYuv = isYuvReaderSurface(surface) || shouldKeepYuvReaderSurfaceForPackage(surface, packageName);
+                    boolean isPreview = (virtualIndex == 0 && !isJpeg);
+
+                    if (isPreview) {
+                        Surface vSurface = createVirtualSurface(virtualIndex++);
+                        originalToVirtualMap.put(surface, vSurface);
+                        long handle = getSurfaceNativeHandle(surface);
+                        if (handle != 0L) originalNativeToVirtualMap.put(handle, vSurface);
+                        rememberPreviewSurface(surface);
+                        rewritten.add(vSurface);
+                        LogUtil.log("【CS】SessionSurfaces 替换主预览 Surface -> virtual[0]: " + surface);
+                    } else if (isYuv) {
+                        Surface vSurface = createVirtualSurface(virtualIndex++);
+                        originalToVirtualMap.put(surface, vSurface);
+                        long handle = getSurfaceNativeHandle(surface);
+                        if (handle != 0L) originalNativeToVirtualMap.put(handle, vSurface);
+                        rememberReaderPlaybackSurface(surface);
+                        sessionKeptYuvSurfaces.add(surface);
+                        rewritten.add(vSurface);
+                        LogUtil.log("【CS】SessionSurfaces [方案一替身置换] 替换 YUV Reader Surface -> virtual[" + (virtualIndex - 1) + "]: " + surface);
+                    } else {
+                        rewritten.add(surface);
+                        LogUtil.log("【CS】SessionSurfaces 保留真实辅助/JPEG Surface: " + surface);
+                    }
+                }
+            }
+        }
+        if (rewritten.isEmpty()) {
+            rewritten.add(createVirtualSurface(0));
+        }
+        return new ArrayList<>(rewritten);
+    }
+
+    public boolean isSurfaceTextureSurface(Surface surface) {
+        if (surface == null) return false;
+        String s = surface.toString();
+        return s.contains("SurfaceTexture") || s.contains("SurfaceView") || s.contains("SurfaceHolder");
+    }
+
+    private List<OutputConfiguration> rewriteOutputConfigurations(List<?> outputs) {
+        return rewriteOutputConfigurations(outputs, getCurrentPackageName());
+    }
+
+    private List<OutputConfiguration> rewriteOutputConfigurations(List<?> outputs, String packageName) {
+        List<OutputConfiguration> rewritten = new ArrayList<>();
+        sessionKeptYuvSurfaces.clear();
+        int virtualIndex = 0;
+        if (outputs != null) {
+            for (Object output : outputs) {
+                if (!(output instanceof OutputConfiguration)) {
+                    continue;
+                }
+                OutputConfiguration config = (OutputConfiguration) output;
+                Surface originalSurface = config.getSurface();
+                boolean isJpeg = isJpegReaderSurface(originalSurface);
+                boolean isYuv = isYuvReaderSurface(originalSurface) || shouldKeepYuvReaderSurfaceForPackage(originalSurface, packageName);
+                boolean isPreview = (virtualIndex == 0 && !isJpeg);
+
+                if (isPreview) {
+                    Surface vSurface = createVirtualSurface(virtualIndex++);
+                    if (originalSurface != null) {
+                        originalToVirtualMap.put(originalSurface, vSurface);
+                        long handle = getSurfaceNativeHandle(originalSurface);
+                        if (handle != 0L) originalNativeToVirtualMap.put(handle, vSurface);
+                        rememberPreviewSurface(originalSurface);
+                    }
+                    rewritten.add(createOutputConfiguration(config, vSurface, packageName));
+                    LogUtil.log("【CS】OutputConfig 替换主预览 Surface -> virtual[0]: " + originalSurface);
+                } else if (isYuv) {
+                    Surface vSurface = createVirtualSurface(virtualIndex++);
+                    if (originalSurface != null) {
+                        originalToVirtualMap.put(originalSurface, vSurface);
+                        long handle = getSurfaceNativeHandle(originalSurface);
+                        if (handle != 0L) originalNativeToVirtualMap.put(handle, vSurface);
+                        rememberReaderPlaybackSurface(originalSurface);
+                        sessionKeptYuvSurfaces.add(originalSurface);
+                    }
+                    rewritten.add(createOutputConfiguration(config, vSurface, packageName));
+                    LogUtil.log("【CS】OutputConfig [方案一替身置换] 替换 YUV Reader Surface -> virtual[" + (virtualIndex - 1) + "]: " + originalSurface);
+                } else {
+                    rewritten.add(createOutputConfiguration(config, originalSurface, packageName));
+                    LogUtil.log("【CS】OutputConfig 保留真实辅助/JPEG Surface: " + originalSurface);
+                }
+            }
+        }
+        if (rewritten.isEmpty()) {
+            rewritten.add(new OutputConfiguration(createVirtualSurface(0)));
+        }
+        return rewritten;
+    }
+
+    private OutputConfiguration createOutputConfiguration(OutputConfiguration original, Surface surface,
+            String packageName) {
+        OutputConfiguration rewritten = null;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                rewritten = new OutputConfiguration(original.getSurfaceGroupId(), surface);
+            } catch (Throwable ignored) {
+            }
+        }
+        if (rewritten == null) {
+            rewritten = new OutputConfiguration(surface);
+        }
+        copyOutputConfigurationMetadata(original, rewritten);
+        copySharedSurfaces(original, rewritten, surface, packageName);
+        return rewritten;
+    }
+
+    private void copyOutputConfigurationMetadata(OutputConfiguration original,
+            OutputConfiguration rewritten) {
+        copyOutputConfigurationProperty(original, rewritten,
+                "getPhysicalCameraId", "setPhysicalCameraId");
+        copyOutputConfigurationProperty(original, rewritten,
+                "getStreamUseCase", "setStreamUseCase");
+        copyOutputConfigurationProperty(original, rewritten,
+                "getDynamicRangeProfile", "setDynamicRangeProfile");
+        copyOutputConfigurationProperty(original, rewritten,
+                "getTimestampBase", "setTimestampBase");
+        copyOutputConfigurationProperty(original, rewritten,
+                "getMirrorMode", "setMirrorMode");
+        copyOutputConfigurationProperty(original, rewritten,
+                "getReadoutTimestampEnabled", "setReadoutTimestampEnabled");
+        copyOutputConfigurationProperty(original, rewritten,
+                "getColorSpace", "setColorSpace");
+        copyOutputConfigurationSensorPixelModes(original, rewritten);
+    }
+
+    private void copyOutputConfigurationProperty(OutputConfiguration original,
+            OutputConfiguration rewritten, String getterName, String setterName) {
+        try {
+            Object value = invokeNoArgMethod(original, getterName);
+            if (value != null) {
+                invokeCompatibleSingleArgMethod(rewritten, setterName, value);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void copyOutputConfigurationSensorPixelModes(OutputConfiguration original,
+            OutputConfiguration rewritten) {
+        try {
+            Object value = invokeNoArgMethod(original, "getSensorPixelModesUsed");
+            if (value instanceof int[]) {
+                for (int pixelMode : (int[]) value) {
+                    invokeCompatibleSingleArgMethod(rewritten, "addSensorPixelModeUsed", pixelMode);
+                }
+            } else if (value instanceof Iterable) {
+                for (Object pixelMode : (Iterable<?>) value) {
+                    if (pixelMode != null) {
+                        invokeCompatibleSingleArgMethod(rewritten, "addSensorPixelModeUsed", pixelMode);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void copySharedSurfaces(OutputConfiguration original, OutputConfiguration rewritten,
+            Surface rewrittenSurface, String packageName) {
+        try {
+            @SuppressWarnings("unchecked")
+            List<Surface> originalSurfaces = (List<Surface>) invokeNoArgMethod(original, "getSurfaces");
+            if (originalSurfaces == null || originalSurfaces.size() <= 1) {
+                return;
+            }
+            invokeNoArgMethod(rewritten, "enableSurfaceSharing");
+            Surface originalPrimarySurface = original.getSurface();
+            boolean keptOriginalPrimary = rewrittenSurface != null && rewrittenSurface.equals(originalPrimarySurface);
+            for (Surface extraSurface : originalSurfaces) {
+                if (extraSurface == null || extraSurface.equals(originalPrimarySurface)) {
+                    continue;
+                }
+                boolean keepExtraSurface = shouldKeepRealReaderSurfaceForPackage(extraSurface, packageName)
+                        || shouldKeepYuvReaderSurfaceForPackage(extraSurface, packageName);
+                if (!keepExtraSurface && !keptOriginalPrimary) {
+                    continue;
+                }
+                invokeCompatibleSingleArgMethod(rewritten, "addSurface", extraSurface);
+                if (shouldKeepYuvReaderSurfaceForPackage(extraSurface, packageName)) {
+                    sessionKeptYuvSurfaces.add(extraSurface);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private SessionConfiguration rewriteSessionConfiguration(SessionConfiguration sessionConfiguration) {
+        String packageName = getCurrentPackageName();
+        List<OutputConfiguration> outputs = rewriteOutputConfigurations(sessionConfiguration.getOutputConfigurations(),
+                packageName);
+        SessionConfiguration rewritten = new SessionConfiguration(
+                sessionConfiguration.getSessionType(),
+                outputs,
+                sessionConfiguration.getExecutor(),
+                sessionConfiguration.getStateCallback());
+        try {
+            InputConfiguration inputConfiguration = sessionConfiguration.getInputConfiguration();
+            if (inputConfiguration != null) {
+                rewritten.setInputConfiguration(inputConfiguration);
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            CaptureRequest sessionParameters = sessionConfiguration.getSessionParameters();
+            if (sessionParameters != null) {
+                rewritten.setSessionParameters(sessionParameters);
+            }
+        } catch (Throwable ignored) {
+        }
+        return rewritten;
+    }
