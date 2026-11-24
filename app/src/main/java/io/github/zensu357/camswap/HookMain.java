@@ -137,10 +137,9 @@ public class HookMain {
                     camera2Hook.restartYuvDecoderForSourceChange();
                 }
 
-                @Override
-                public void onCameraSourceChanged() {
+               public void onCameraSourceChanged() {
                     Camera1Handler.applyCameraSource();
-                    camera2Hook.restartYuvDecoderForSourceChange();
+                    camera2Hook.onCameraSourceChanged();
                 }
 
                 @Override
