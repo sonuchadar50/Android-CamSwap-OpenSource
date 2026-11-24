@@ -1,4 +1,3 @@
-Java
 package io.github.zensu357.camswap;
 
 import android.graphics.SurfaceTexture;
@@ -937,8 +936,6 @@ public final class Camera2SessionHook {
         }
         return rewritten;
     }
-Camera2SessionHook.java — PART 2 (Part 1 ke bilkul neeche cursor rakh kar paste karein, aur aakhir mein } zaroor check karein):
-Java
     void hookAllCreateSessionVariants(Class<?> deviceClass) {
         if (deviceClass == null) {
             return;
