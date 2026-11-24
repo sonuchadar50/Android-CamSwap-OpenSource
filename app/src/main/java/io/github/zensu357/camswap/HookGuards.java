@@ -22,23 +22,24 @@ public final class HookGuards {
         return new File(currentPath);
     }
 
-    // ---- Legacy overload (File-based) — kept for compatibility ----
-
     public static boolean shouldBypass(String packageName, File videoFile) {
         if (VideoManager.getConfig().getBoolean(ConfigManager.KEY_DISABLE_MODULE, false)) {
             return true;
         }
-        // Stream mode: delegate to MediaSourceDescriptor-based check
+        if (SwitchablePreview.useOriginalCamera()) {
+            return true;
+        }
         if (VideoManager.isStreamMode()) {
             return shouldBypass(packageName, VideoManager.getCurrentMediaSource());
         }
         return shouldBypassMissingVideo(packageName, videoFile);
     }
 
-    // ---- New overload (MediaSourceDescriptor-based) ----
-
     public static boolean shouldBypass(String packageName, MediaSourceDescriptor source) {
         if (VideoManager.getConfig().getBoolean(ConfigManager.KEY_DISABLE_MODULE, false)) {
+            return true;
+        }
+        if (SwitchablePreview.useOriginalCamera()) {
             return true;
         }
         HookMain.need_to_show_toast = !VideoManager.getConfig().getBoolean(ConfigManager.KEY_DISABLE_TOAST, false);
@@ -58,13 +59,14 @@ public final class HookGuards {
         if (VideoManager.getConfig().getBoolean(ConfigManager.KEY_DISABLE_MODULE, false)) {
             return true;
         }
+        if (SwitchablePreview.useOriginalCamera()) {
+            return true;
+        }
 
-        // 1. Check if provider backed / available
         if (VideoManager.isUsingProviderBackedVideo() || VideoManager.isProviderAvailable()) {
             return false;
         }
 
-        // 2. Check if private cached video exists
         if (HookMain.toast_content != null) {
             try {
                 File privateVideo = new File(HookMain.toast_content.getFilesDir(), "vcam_private.mp4");
@@ -75,12 +77,10 @@ public final class HookGuards {
             }
         }
 
-        // 3. Check if local video file exists and is readable
         if (videoFile != null && videoFile.exists() && videoFile.canRead()) {
             return false;
         }
 
-        // 4. Try querying VideoProvider PFD
         try {
             android.os.ParcelFileDescriptor pfd = VideoManager.getVideoPFD();
             if (pfd != null) {
