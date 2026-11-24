@@ -1,8 +1,6 @@
 package io.github.zensu357.camswap;
 
 public class SwitchablePreview {
-    private static volatile boolean sessionInitialized = false;
-
     public static boolean useOriginalCamera() {
         try {
             ConfigManager cm = HookMain.getConfig();
