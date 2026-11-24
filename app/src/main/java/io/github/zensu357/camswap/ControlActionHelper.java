@@ -44,7 +44,7 @@ public final class ControlActionHelper {
         ConfigManager config = new ConfigManager();
         config.setContext(context);
         config.forceReload();
-        boolean original = !config.getBoolean(ConfigManager.KEY_USE_ORIGINAL_CAMERA, false);
+        boolean original = !config.getBoolean(ConfigManager.KEY_USE_ORIGINAL_CAMERA, true);
         config.setBoolean(ConfigManager.KEY_USE_ORIGINAL_CAMERA, original);
         return original;
     }
